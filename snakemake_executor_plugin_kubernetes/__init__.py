@@ -52,6 +52,79 @@ def unparse_persistent_volumes(args: List[PersistentVolume]) -> List[str]:
 
 
 @dataclass
+class NodeSelector:
+    key: str
+    value: str
+
+    @classmethod
+    def parse(cls, arg: str) -> Self:
+        spec = arg.split("=")
+        if len(spec) != 2:
+            raise WorkflowError(
+                f"Invalid node selector spec ({arg}), has to be <key>=<value>."
+            )
+        key, value = spec
+        return cls(key=key, value=value)
+
+    def unparse(self) -> str:
+        return f"{self.key}={self.value}"
+
+
+def parse_node_selectors(args: List[str]) -> List[NodeSelector]:
+    return [NodeSelector.parse(arg) for arg in args]
+
+
+def unparse_node_selectors(args: List[NodeSelector]) -> List[str]:
+    return [arg.unparse() for arg in args]
+
+
+@dataclass
+class Toleration:
+    key: str
+    operator: str
+    value: str
+    effect: str
+
+    @classmethod
+    def parse(cls, arg: str) -> Self:
+        spec = arg.split(":")
+        if len(spec) != 4:
+            raise WorkflowError(
+                f"Invalid toleration spec ({arg}), has to be <key>:<operator>:<value>:<effect>. "
+                "Example: 'nvidia.com/gpu:Equal:present:NoSchedule'"
+            )
+        key, operator, value, effect = spec
+        # Validate key
+        if not key:
+            raise WorkflowError(
+                "Toleration key cannot be empty."
+            )
+        # Validate operator
+        if operator not in ["Equal", "Exists"]:
+            raise WorkflowError(
+                f"Invalid operator {operator} in toleration spec. Must be 'Equal' or 'Exists'."
+            )
+        # Validate effect
+        if effect not in ["NoSchedule", "PreferNoSchedule", "NoExecute"]:
+            raise WorkflowError(
+                f"Invalid effect {effect} in toleration spec. "
+                "Must be 'NoSchedule', 'PreferNoSchedule', or 'NoExecute'."
+            )
+        return cls(key=key, operator=operator, value=value, effect=effect)
+
+    def unparse(self) -> str:
+        return f"{self.key}:{self.operator}:{self.value}:{self.effect}"
+
+
+def parse_tolerations(args: List[str]) -> List[Toleration]:
+    return [Toleration.parse(arg) for arg in args]
+
+
+def unparse_tolerations(args: List[Toleration]) -> List[str]:
+    return [arg.unparse() for arg in args]
+
+
+@dataclass
 class ExecutorSettings(ExecutorSettingsBase):
     namespace: str = field(
         default="default", metadata={"help": "The namespace to use for submitted jobs."}
@@ -92,6 +165,25 @@ class ExecutorSettings(ExecutorSettingsBase):
             "job container (<name>:<path>). ",
             "parse_func": parse_persistent_volumes,
             "unparse_func": unparse_persistent_volumes,
+            "nargs": "+",
+        },
+    )
+    node_selectors: List[NodeSelector] = field(
+        default_factory=list,
+        metadata={
+            "help": "Node selectors to apply to the job pod (<key>=<value>).",
+            "parse_func": parse_node_selectors,
+            "unparse_func": unparse_node_selectors,
+            "nargs": "+",
+        },
+    )
+    tolerations: List[Toleration] = field(
+        default_factory=list,
+        metadata={
+            "help": "Tolerations to apply to the job pod (<key>:<operator>:<value>:<effect>). "
+            "Example: 'nvidia.com/gpu:Equal:present:NoSchedule'",
+            "parse_func": parse_tolerations,
+            "unparse_func": unparse_tolerations,
             "nargs": "+",
         },
     )
@@ -144,6 +236,8 @@ class Executor(RemoteExecutor):
         self.container_image = self.workflow.remote_execution_settings.container_image
         self.privileged = self.workflow.executor_settings.privileged
         self.persistent_volumes = self.workflow.executor_settings.persistent_volumes
+        self.node_selectors = self.workflow.executor_settings.node_selectors
+        self.tolerations = self.workflow.executor_settings.tolerations
 
         self.logger.info(f"Using {self.container_image} for Kubernetes jobs.")
 
@@ -189,17 +283,24 @@ class Executor(RemoteExecutor):
 
         # Node selector
         node_selector = {}
+        for ns in self.node_selectors:
+            node_selector[ns.key] = ns.value
+            self.logger.debug(f"Set node selector for {ns.key}: {ns.value}")
         if "machine_type" in resources_dict.keys():
             node_selector["node.kubernetes.io/instance-type"] = resources_dict[
                 "machine_type"
             ]
             self.logger.debug(f"Set node selector for machine type: {node_selector}")
 
-        # Initialize PodSpec
-        body.spec = kubernetes.client.V1PodSpec(
-            containers=[container], node_selector=node_selector, restart_policy="Never"
-        )
-
+        # Tolerations
+        tolerations = []
+        for t in self.tolerations:
+            tolerations.append(kubernetes.client.V1Toleration(
+                key=t.key,
+                operator=t.operator,
+                value=None if t.operator == "Exists" else t.value,
+                effect=t.effect,
+            ))
         # Add toleration for GPU nodes if GPU is requested
         if "gpu" in resources_dict:
             # Manufacturer logic
@@ -211,10 +312,7 @@ class Executor(RemoteExecutor):
                 )
             manufacturer_lc = manufacturer.lower()
             if manufacturer_lc == "nvidia":
-                # Toleration for nvidia.com/gpu
-                if body.spec.tolerations is None:
-                    body.spec.tolerations = []
-                body.spec.tolerations.append(
+                tolerations.append(
                     kubernetes.client.V1Toleration(
                         key="nvidia.com/gpu",
                         operator="Equal",
@@ -228,9 +326,7 @@ class Executor(RemoteExecutor):
 
             elif manufacturer_lc == "amd":
                 # Toleration for amd.com/gpu
-                if body.spec.tolerations is None:
-                    body.spec.tolerations = []
-                body.spec.tolerations.append(
+                tolerations.append(
                     kubernetes.client.V1Toleration(
                         key="amd.com/gpu",
                         operator="Equal",
@@ -247,6 +343,11 @@ class Executor(RemoteExecutor):
                     f"Unsupported GPU manufacturer '{manufacturer}'. "
                     "Must be 'nvidia' or 'amd'."
                 )
+
+        # Initialize PodSpec
+        body.spec = kubernetes.client.V1PodSpec(
+            containers=[container], node_selector=node_selector, tolerations=tolerations, restart_policy="Never"
+        )
 
         # capabilities
         if (
